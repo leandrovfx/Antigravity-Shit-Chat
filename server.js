@@ -4,15 +4,34 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 3000;
-const CDP_PORTS = [9000, 9001, 9002, 9003];
 const DISCOVERY_INTERVAL = 10000;
 const POLL_INTERVAL = 3000;
+
+// Discover Antigravity CDP ports dynamically via lsof
+function getAntigravityPorts() {
+    try {
+        const out = execSync('lsof -i -n -P 2>/dev/null | grep -i "Antigrav\\|Electron" | grep LISTEN', { timeout: 3000 }).toString();
+        const ports = [];
+        for (const line of out.split('\n')) {
+            const m = line.match(/127\.0\.0\.1:?(\d+)\s*\(LISTEN\)/);
+            if (m) ports.push(parseInt(m[1], 10));
+        }
+        // Also always try common Antigravity ports as fallback
+        for (const p of [9000, 9001, 9002, 9003]) {
+            if (!ports.includes(p)) ports.push(p);
+        }
+        return ports;
+    } catch {
+        return [9000, 9001, 9002, 9003];
+    }
+}
 
 // --- State ---
 let cascades = new Map();
@@ -233,10 +252,14 @@ function getJson(url) {
 
 async function discover() {
     const allTargets = [];
-    await Promise.all(CDP_PORTS.map(async (port) => {
+    const cdpPorts = getAntigravityPorts();
+    await Promise.all(cdpPorts.map(async (port) => {
         const list = await getJson(`http://127.0.0.1:${port}/json/list`);
-        list.filter(t => t.url?.includes('workbench.html') || t.title?.includes('workbench'))
+        if (!Array.isArray(list)) return;
+        // Accept workbench pages OR any page-type target (broader catch for Antigravity)
+        list.filter(t => t.type === 'page' || t.url?.includes('workbench.html') || t.title?.includes('workbench'))
             .forEach(t => allTargets.push({ ...t, port }));
+        if (list.length > 0) console.log(`🔍 Port ${port}: ${list.length} targets found`);
     }));
 
     const newCascades = new Map();
