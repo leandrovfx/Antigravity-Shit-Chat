@@ -1,432 +1,397 @@
 #!/usr/bin/env node
-import express from 'express';
-import { WebSocketServer } from 'ws';
-import http from 'http';
-import WebSocket from 'ws';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+// server.js — zero external dependencies, Node.js native only
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname = path.dirname(__filename);
 
-const PORTS = [9000, 9001, 9002, 9003];
+const PORT = process.env.PORT || 3000;
+const CDP_PORTS = [9000, 9001, 9002, 9003];
 const DISCOVERY_INTERVAL = 10000;
 const POLL_INTERVAL = 3000;
 
-// Application State
-let cascades = new Map(); // Map<cascadeId, { id, cdp: { ws, contexts, rootContextId }, metadata, snapshot, snapshotHash }>
-let wss = null;
+// --- State ---
+let cascades = new Map();
+const wsClients = new Set();
 
-// --- Helpers ---
-
-// Simple hash function
-function hashString(str) {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash;
-    }
-    return hash.toString(36);
+// --- WebSocket (RFC 6455) ---
+function wsHandshake(req, socket) {
+    const key = req.headers['sec-websocket-key'];
+    const accept = crypto
+        .createHash('sha1')
+        .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+        .digest('base64');
+    socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
 }
 
-// HTTP GET JSON
+function wsDecodeFrame(buf) {
+    if (buf.length < 2) return null;
+    const fin = (buf[0] & 0x80) !== 0;
+    const opcode = buf[0] & 0x0f;
+    const masked = (buf[1] & 0x80) !== 0;
+    let payloadLen = buf[1] & 0x7f;
+    let offset = 2;
+    if (payloadLen === 126) { payloadLen = buf.readUInt16BE(2); offset = 4; }
+    else if (payloadLen === 127) { payloadLen = Number(buf.readBigUInt64BE(2)); offset = 10; }
+    if (buf.length < offset + (masked ? 4 : 0) + payloadLen) return null;
+    const mask = masked ? buf.slice(offset, offset + 4) : null;
+    if (masked) offset += 4;
+    const payload = buf.slice(offset, offset + payloadLen);
+    if (masked) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+    return { opcode, payload: payload.toString('utf8'), fin };
+}
+
+function wsEncodeFrame(data) {
+    const payload = Buffer.from(data, 'utf8');
+    const len = payload.length;
+    let header;
+    if (len < 126) {
+        header = Buffer.alloc(2);
+        header[0] = 0x81;
+        header[1] = len;
+    } else if (len < 65536) {
+        header = Buffer.alloc(4);
+        header[0] = 0x81;
+        header[1] = 126;
+        header.writeUInt16BE(len, 2);
+    } else {
+        header = Buffer.alloc(10);
+        header[0] = 0x81;
+        header[1] = 127;
+        header.writeBigUInt64BE(BigInt(len), 2);
+    }
+    return Buffer.concat([header, payload]);
+}
+
+function wsBroadcast(obj) {
+    const frame = wsEncodeFrame(JSON.stringify(obj));
+    for (const sock of wsClients) {
+        try { sock.write(frame); } catch (e) { wsClients.delete(sock); }
+    }
+}
+
+// --- Helpers ---
+function hashString(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) { h = ((h << 5) - h) + str.charCodeAt(i); h = h & h; }
+    return Math.abs(h).toString(36);
+}
+
 function getJson(url) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         const req = http.get(url, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                try { resolve(JSON.parse(data)); } catch (e) { resolve([]); } // return empty on parse error
-            });
+            let d = '';
+            res.on('data', c => d += c);
+            res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve([]); } });
         });
-        req.on('error', () => resolve([])); // return empty on network error
-        req.setTimeout(2000, () => {
-            req.destroy();
-            resolve([]);
-        });
+        req.on('error', () => resolve([]));
+        req.setTimeout(2000, () => { req.destroy(); resolve([]); });
     });
+}
+
+function getMime(ext) {
+    return { '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' }[ext] || 'application/octet-stream';
 }
 
 // --- CDP Logic ---
+function cdpConnect(wsUrl) {
+    return new Promise((resolve, reject) => {
+        // Parse ws:// URL
+        const m = wsUrl.match(/^ws:\/\/([^/:]+):?(\d+)?(\/.*)$/);
+        if (!m) return reject(new Error('bad url'));
+        const host = m[1], port = parseInt(m[2] || '80', 10), urlPath = m[3];
+        const key = crypto.randomBytes(16).toString('base64');
 
-async function connectCDP(url) {
-    const ws = new WebSocket(url);
-    await new Promise((resolve, reject) => {
-        ws.on('open', resolve);
-        ws.on('error', reject);
+        const sock = new (await import('node:net').then(n => n)).Socket();
+        // Use raw TCP approach
+        return reject(new Error('Use built-in approach')); // fallback below
     });
+}
 
-    let idCounter = 1;
-    const call = (method, params) => new Promise((resolve, reject) => {
-        const id = idCounter++;
-        const handler = (msg) => {
-            const data = JSON.parse(msg);
-            if (data.id === id) {
-                ws.off('message', handler);
-                if (data.error) reject(data.error);
-                else resolve(data.result);
-            }
-        };
-        ws.on('message', handler);
-        ws.send(JSON.stringify({ id, method, params }));
+// Use Node's built-in http to upgrade for CDP WebSocket
+function cdpConnectHTTP(wsUrl) {
+    return new Promise((resolve, reject) => {
+        const m = wsUrl.match(/^ws:\/\/([^/:]+):?(\d+)?(\/.*)$/);
+        if (!m) return reject(new Error('bad ws url: ' + wsUrl));
+        const host = m[1], port = parseInt(m[2] || '80', 10), urlPath = m[3];
+        const key = crypto.randomBytes(16).toString('base64');
+
+        const req = http.request({ host, port, path: urlPath, headers: { 'Connection': 'Upgrade', 'Upgrade': 'websocket', 'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13' } });
+        req.on('upgrade', (res, socket) => {
+            let idCounter = 1;
+            const pending = new Map();
+            const contexts = [];
+            let buf = Buffer.alloc(0);
+
+            socket.on('data', (chunk) => {
+                buf = Buffer.concat([buf, chunk]);
+                while (buf.length >= 2) {
+                    const frame = wsDecodeFrame(buf);
+                    if (!frame) break;
+                    const consumed = frameSize(buf);
+                    buf = buf.slice(consumed);
+                    if (frame.opcode === 8) { socket.destroy(); break; }
+                    if (frame.opcode !== 1) continue;
+                    try {
+                        const data = JSON.parse(frame.payload);
+                        if (data.id && pending.has(data.id)) {
+                            const { resolve, reject } = pending.get(data.id);
+                            pending.delete(data.id);
+                            if (data.error) reject(data.error); else resolve(data.result);
+                        }
+                        if (data.method === 'Runtime.executionContextCreated') contexts.push(data.params.context);
+                        else if (data.method === 'Runtime.executionContextDestroyed') {
+                            const idx = contexts.findIndex(c => c.id === data.params.executionContextId);
+                            if (idx !== -1) contexts.splice(idx, 1);
+                        }
+                    } catch (e) { }
+                }
+            });
+            socket.on('error', () => { });
+            socket.on('close', () => { });
+
+            const call = (method, params) => new Promise((res, rej) => {
+                const id = idCounter++;
+                pending.set(id, { resolve: res, reject: rej });
+                const payload = Buffer.from(JSON.stringify({ id, method, params }), 'utf8');
+                const header = Buffer.alloc(payload.length < 126 ? 2 : 4);
+                header[0] = 0x81;
+                const mask = crypto.randomBytes(4);
+                if (payload.length < 126) { header[1] = 0x80 | payload.length; }
+                else { header[1] = 0x80 | 126; header.writeUInt16BE(payload.length, 2); }
+                const masked = Buffer.from(payload);
+                for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i % 4];
+                socket.write(Buffer.concat([header, mask, masked]));
+                setTimeout(() => { if (pending.has(id)) { pending.delete(id); rej(new Error('timeout')); } }, 5000);
+            });
+
+            resolve({ socket, call, contexts, rootContextId: null });
+        });
+        req.on('error', reject);
+        req.setTimeout(3000, () => { req.destroy(); reject(new Error('timeout')); });
+        req.end();
     });
+}
 
-    const contexts = [];
-    ws.on('message', (msg) => {
-        try {
-            const data = JSON.parse(msg);
-            if (data.method === 'Runtime.executionContextCreated') {
-                contexts.push(data.params.context);
-            } else if (data.method === 'Runtime.executionContextDestroyed') {
-                const idx = contexts.findIndex(c => c.id === data.params.executionContextId);
-                if (idx !== -1) contexts.splice(idx, 1);
-            }
-        } catch (e) { }
-    });
-
-    await call("Runtime.enable", {});
-    await new Promise(r => setTimeout(r, 500)); // give time for contexts to load
-
-    return { ws, call, contexts, rootContextId: null };
+function frameSize(buf) {
+    if (buf.length < 2) return 0;
+    const masked = (buf[1] & 0x80) !== 0;
+    let payloadLen = buf[1] & 0x7f;
+    let offset = 2;
+    if (payloadLen === 126) { payloadLen = buf.readUInt16BE(2); offset = 4; }
+    else if (payloadLen === 127) { payloadLen = Number(buf.readBigUInt64BE(2)); offset = 10; }
+    return offset + (masked ? 4 : 0) + payloadLen;
 }
 
 async function extractMetadata(cdp) {
-    const SCRIPT = `(() => {
-        const cascade = document.getElementById('cascade');
-        if (!cascade) return { found: false };
-        
-        let chatTitle = null;
-        const possibleTitleSelectors = ['h1', 'h2', 'header', '[class*="title"]'];
-        for (const sel of possibleTitleSelectors) {
-            const el = document.querySelector(sel);
-            if (el && el.textContent.length > 2 && el.textContent.length < 50) {
-                chatTitle = el.textContent.trim();
-                break;
-            }
-        }
-        
-        return {
-            found: true,
-            chatTitle: chatTitle || 'Agent',
-            isActive: document.hasFocus()
-        };
-    })()`;
-
-    // Try finding context first if not known
+    const SCRIPT = `(()=>{const el=document.getElementById('cascade')||document.querySelector('main')||document.querySelector('#root')||document.body;if(!el)return{found:false};let title=null;for(const s of['h1','h2','header','[class*="title"]']){const e=document.querySelector(s);if(e&&e.textContent.length>2&&e.textContent.length<50){title=e.textContent.trim();break;}}return{found:true,chatTitle:title||'Agent',isActive:document.hasFocus()};})()`;
     if (cdp.rootContextId) {
         try {
-            const res = await cdp.call("Runtime.evaluate", { expression: SCRIPT, returnByValue: true, contextId: cdp.rootContextId });
-            if (res.result?.value?.found) return { ...res.result.value, contextId: cdp.rootContextId };
-        } catch (e) { cdp.rootContextId = null; } // reset if stale
+            const r = await cdp.call('Runtime.evaluate', { expression: SCRIPT, returnByValue: true, contextId: cdp.rootContextId });
+            if (r.result?.value?.found) return { ...r.result.value, contextId: cdp.rootContextId };
+        } catch { cdp.rootContextId = null; }
     }
-
-    // Search all contexts
     for (const ctx of cdp.contexts) {
         try {
-            const result = await cdp.call("Runtime.evaluate", { expression: SCRIPT, returnByValue: true, contextId: ctx.id });
-            if (result.result?.value?.found) {
-                return { ...result.result.value, contextId: ctx.id };
-            }
-        } catch (e) { }
+            const r = await cdp.call('Runtime.evaluate', { expression: SCRIPT, returnByValue: true, contextId: ctx.id });
+            if (r.result?.value?.found) return { ...r.result.value, contextId: ctx.id };
+        } catch { }
     }
     return null;
 }
 
 async function captureCSS(cdp) {
-    const SCRIPT = `(() => {
-        // Gather CSS and namespace it basic way to prevent leaks
-        let css = '';
-        for (const sheet of document.styleSheets) {
-            try { 
-                for (const rule of sheet.cssRules) {
-                    let text = rule.cssText;
-                    // Naive scoping: replace body/html with #cascade locator
-                    // This prevents the monitored app's global backgrounds from overriding our monitor's body
-                    text = text.replace(/(^|[\\s,}])body(?=[\\s,{])/gi, '$1#cascade');
-                    text = text.replace(/(^|[\\s,}])html(?=[\\s,{])/gi, '$1#cascade');
-                    css += text + '\\n'; 
-                }
-            } catch (e) { }
-        }
-        return { css };
-    })()`;
-
-    const contextId = cdp.rootContextId;
-    if (!contextId) return null;
-
+    const SCRIPT = `(()=>{let css='';for(const s of document.styleSheets){try{for(const r of s.cssRules){let t=r.cssText;t=t.replace(/(^|[\\s,}])body(?=[\\s,{])/gi,'$1#cascade');t=t.replace(/(^|[\\s,}])html(?=[\\s,{])/gi,'$1#cascade');css+=t+'\\n';}}catch(e){}}return{css};})()`;
+    if (!cdp.rootContextId) return '';
     try {
-        const result = await cdp.call("Runtime.evaluate", {
-            expression: SCRIPT,
-            returnByValue: true,
-            contextId: contextId
-        });
-        return result.result?.value?.css || '';
-    } catch (e) { return ''; }
+        const r = await cdp.call('Runtime.evaluate', { expression: SCRIPT, returnByValue: true, contextId: cdp.rootContextId });
+        return r.result?.value?.css || '';
+    } catch { return ''; }
 }
 
 async function captureHTML(cdp) {
-    const SCRIPT = `(() => {
-        const cascade = document.getElementById('cascade');
-        if (!cascade) return { error: 'cascade not found' };
-        
-        const clone = cascade.cloneNode(true);
-        // Remove input box to keep snapshot clean
-        const input = clone.querySelector('[contenteditable="true"]')?.closest('div[id^="cascade"] > div');
-        if (input) input.remove();
-        
-        const bodyStyles = window.getComputedStyle(document.body);
-
-        return {
-            html: clone.outerHTML,
-            bodyBg: bodyStyles.backgroundColor,
-            bodyColor: bodyStyles.color
-        };
-    })()`;
-
-    const contextId = cdp.rootContextId;
-    if (!contextId) return null;
-
+    const SCRIPT = `(()=>{const el=document.getElementById('cascade')||document.querySelector('main')||document.querySelector('#root')||document.body;if(!el)return{error:'not found'};const clone=el.cloneNode(true);if(clone.tagName==='BODY'||!clone.id)clone.id='cascade';const inp=clone.querySelector('[contenteditable="true"]')?.closest('div[id^="cascade"]>div');if(inp)inp.remove();const bs=window.getComputedStyle(document.body);return{html:clone.outerHTML,bodyBg:bs.backgroundColor,bodyColor:bs.color};})()`;
+    if (!cdp.rootContextId) return null;
     try {
-        const result = await cdp.call("Runtime.evaluate", {
-            expression: SCRIPT,
-            returnByValue: true,
-            contextId: contextId
-        });
-        if (result.result?.value && !result.result.value.error) {
-            return result.result.value;
-        }
-    } catch (e) { }
+        const r = await cdp.call('Runtime.evaluate', { expression: SCRIPT, returnByValue: true, contextId: cdp.rootContextId });
+        if (r.result?.value && !r.result.value.error) return r.result.value;
+    } catch { }
     return null;
 }
 
-// --- Main App Logic ---
+async function injectMessage(cdp, text) {
+    const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+    const SCRIPT = `(async()=>{const ed=document.querySelector('[contenteditable="true"]')||document.querySelector('[contenteditable="plaintext-only"]')||document.querySelector('[contenteditable]')||document.querySelector('textarea');if(!ed)return{ok:false,reason:'no editor'};ed.focus();if(ed.tagName==='TEXTAREA'){const s=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;s.call(ed,"${escaped}");ed.dispatchEvent(new Event('input',{bubbles:true}));}else{document.execCommand('selectAll',false,null);document.execCommand('insertText',false,"${escaped}");}await new Promise(r=>setTimeout(r,100));const btn=document.querySelector('button[class*="arrow"]')||document.querySelector('button[aria-label*="Send"]')||document.querySelector('button[aria-label*="Enviar"]')||document.querySelector('button[type="submit"]');if(btn){btn.click();}else{ed.dispatchEvent(new KeyboardEvent('keydown',{bubbles:true,key:'Enter',code:'Enter',keyCode:13,which:13}));ed.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:'Enter',code:'Enter',keyCode:13,which:13}));}return{ok:true};})()`;
+    try {
+        const r = await cdp.call('Runtime.evaluate', { expression: SCRIPT, returnByValue: true, contextId: cdp.rootContextId });
+        return r.result?.value || { ok: false };
+    } catch (e) { return { ok: false, reason: e.message }; }
+}
 
+// --- Discovery ---
 async function discover() {
-    // 1. Find all targets
     const allTargets = [];
-    await Promise.all(PORTS.map(async (port) => {
+    await Promise.all(CDP_PORTS.map(async (port) => {
         const list = await getJson(`http://127.0.0.1:${port}/json/list`);
-        const workbenches = list.filter(t => t.url?.includes('workbench.html') || t.title?.includes('workbench'));
-        workbenches.forEach(t => allTargets.push({ ...t, port }));
+        list.filter(t => t.url?.includes('workbench.html') || t.title?.includes('workbench')).forEach(t => allTargets.push({ ...t, port }));
     }));
 
     const newCascades = new Map();
-
-    // 2. Connect/Refresh
     for (const target of allTargets) {
         const id = hashString(target.webSocketDebuggerUrl);
-
-        // Reuse existing
         if (cascades.has(id)) {
-            const existing = cascades.get(id);
-            if (existing.cdp.ws.readyState === WebSocket.OPEN) {
-                // Refresh metadata
-                const meta = await extractMetadata(existing.cdp);
-                if (meta) {
-                    existing.metadata = { ...existing.metadata, ...meta };
-                    if (meta.contextId) existing.cdp.rootContextId = meta.contextId; // Update optimization
-                    newCascades.set(id, existing);
-                    continue;
-                }
+            const ex = cascades.get(id);
+            if (!ex.cdp.socket.destroyed) {
+                const meta = await extractMetadata(ex.cdp).catch(() => null);
+                if (meta) { ex.metadata = { ...ex.metadata, ...meta }; if (meta.contextId) ex.cdp.rootContextId = meta.contextId; newCascades.set(id, ex); continue; }
             }
         }
-
-        // New connection
         try {
             console.log(`🔌 Connecting to ${target.title}`);
-            const cdp = await connectCDP(target.webSocketDebuggerUrl);
+            const cdp = await cdpConnectHTTP(target.webSocketDebuggerUrl);
+            await cdp.call('Runtime.enable', {});
+            await new Promise(r => setTimeout(r, 500));
             const meta = await extractMetadata(cdp);
-
             if (meta) {
                 if (meta.contextId) cdp.rootContextId = meta.contextId;
-                const cascade = {
-                    id,
-                    cdp,
-                    metadata: {
-                        windowTitle: target.title,
-                        chatTitle: meta.chatTitle,
-                        isActive: meta.isActive
-                    },
-                    snapshot: null,
-                    css: await captureCSS(cdp), //only on init bc its huge
-                    snapshotHash: null
-                };
+                const cascade = { id, cdp, metadata: { windowTitle: target.title, chatTitle: meta.chatTitle, isActive: meta.isActive }, snapshot: null, css: await captureCSS(cdp), snapshotHash: null };
                 newCascades.set(id, cascade);
                 console.log(`✨ Added cascade: ${meta.chatTitle}`);
-            } else {
-                cdp.ws.close();
-            }
-        } catch (e) {
-            // console.error(`Failed to connect to ${target.title}: ${e.message}`);
-        }
+            } else { cdp.socket.destroy(); }
+        } catch (e) { /* console.error(e.message) */ }
     }
 
-    // 3. Cleanup old
     for (const [id, c] of cascades.entries()) {
-        if (!newCascades.has(id)) {
-            console.log(`👋 Removing cascade: ${c.metadata.chatTitle}`);
-            try { c.cdp.ws.close(); } catch (e) { }
-        }
+        if (!newCascades.has(id)) { console.log(`👋 Removing: ${c.metadata.chatTitle}`); try { c.cdp.socket.destroy(); } catch { } }
     }
-
-    const changed = cascades.size !== newCascades.size; // Simple check, could be more granular
+    const changed = cascades.size !== newCascades.size;
     cascades = newCascades;
-
     if (changed) broadcastCascadeList();
 }
 
 async function updateSnapshots() {
-    // Parallel updates
     await Promise.all(Array.from(cascades.values()).map(async (c) => {
         try {
-            const snap = await captureHTML(c.cdp); // Only capture HTML
+            const snap = await captureHTML(c.cdp);
             if (snap) {
                 const hash = hashString(snap.html);
-                if (hash !== c.snapshotHash) {
-                    c.snapshot = snap;
-                    c.snapshotHash = hash;
-                    broadcast({ type: 'snapshot_update', cascadeId: c.id });
-                    // console.log(`📸 Updated ${c.metadata.chatTitle}`);
-                }
+                if (hash !== c.snapshotHash) { c.snapshot = snap; c.snapshotHash = hash; wsBroadcast({ type: 'snapshot_update', cascadeId: c.id }); }
             }
-        } catch (e) { }
+        } catch { }
     }));
-}
-
-function broadcast(msg) {
-    if (!wss) return;
-    wss.clients.forEach(c => {
-        if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify(msg));
-    });
 }
 
 function broadcastCascadeList() {
-    const list = Array.from(cascades.values()).map(c => ({
-        id: c.id,
-        title: c.metadata.chatTitle,
-        window: c.metadata.windowTitle,
-        active: c.metadata.isActive
-    }));
-    broadcast({ type: 'cascade_list', cascades: list });
+    wsBroadcast({ type: 'cascade_list', cascades: Array.from(cascades.values()).map(c => ({ id: c.id, title: c.metadata.chatTitle, window: c.metadata.windowTitle, active: c.metadata.isActive })) });
 }
 
-// --- Server Setup ---
+// --- HTTP Server ---
+const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathname = url.pathname;
 
-async function main() {
-    const app = express();
-    const server = http.createServer(app);
-    wss = new WebSocketServer({ server });
+    // CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
 
-    app.use(express.json());
-    app.use(express.static(join(__dirname, 'public')));
+    const json = (data, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); };
+    const notFound = () => json({ error: 'Not found' }, 404);
 
-    // API Routes
-    app.get('/cascades', (req, res) => {
-        res.json(Array.from(cascades.values()).map(c => ({
-            id: c.id,
-            title: c.metadata.chatTitle,
-            active: c.metadata.isActive
-        })));
-    });
+    if (req.method === 'GET' && pathname === '/cascades') {
+        return json(Array.from(cascades.values()).map(c => ({ id: c.id, title: c.metadata.chatTitle, active: c.metadata.isActive })));
+    }
 
-    app.get('/snapshot/:id', (req, res) => {
-        const c = cascades.get(req.params.id);
-        if (!c || !c.snapshot) return res.status(404).json({ error: 'Not found' });
-        res.json(c.snapshot);
-    });
+    const snapMatch = pathname.match(/^\/snapshot\/(.+)$/);
+    if (req.method === 'GET' && snapMatch) {
+        const c = cascades.get(snapMatch[1]);
+        if (!c || !c.snapshot) return notFound();
+        return json(c.snapshot);
+    }
 
-    app.get('/styles/:id', (req, res) => {
-        const c = cascades.get(req.params.id);
-        if (!c) return res.status(404).json({ error: 'Not found' });
-        res.json({ css: c.css || '' });
-    });
-
-    // Alias for simple single-view clients (returns first active or first available)
-    app.get('/snapshot', (req, res) => {
+    if (req.method === 'GET' && pathname === '/snapshot') {
         const active = Array.from(cascades.values()).find(c => c.metadata.isActive) || cascades.values().next().value;
-        if (!active || !active.snapshot) return res.status(503).json({ error: 'No snapshot' });
-        res.json(active.snapshot);
+        if (!active || !active.snapshot) return json({ error: 'No snapshot' }, 503);
+        return json(active.snapshot);
+    }
+
+    const styleMatch = pathname.match(/^\/styles\/(.+)$/);
+    if (req.method === 'GET' && styleMatch) {
+        const c = cascades.get(styleMatch[1]);
+        if (!c) return notFound();
+        return json({ css: c.css || '' });
+    }
+
+    const sendMatch = pathname.match(/^\/send\/(.+)$/);
+    if (req.method === 'POST' && sendMatch) {
+        const c = cascades.get(sendMatch[1]);
+        if (!c) return notFound();
+        let body = '';
+        req.on('data', d => body += d);
+        req.on('end', async () => {
+            try {
+                const { message } = JSON.parse(body);
+                console.log(`Message to ${c.metadata.chatTitle}: ${message}`);
+                const result = await injectMessage(c.cdp, message);
+                if (result.ok) json({ success: true }); else json(result, 500);
+            } catch (e) { json({ error: e.message }, 500); }
+        });
+        return;
+    }
+
+    // Static files
+    let filePath = path.join(__dirname, 'public', pathname === '/' ? 'index.html' : pathname);
+    fs.stat(filePath, (err, stat) => {
+        if (err || !stat.isFile()) { filePath = path.join(__dirname, 'public', 'index.html'); }
+        fs.readFile(filePath, (err2, data) => {
+            if (err2) { res.writeHead(404); res.end('Not found'); return; }
+            const ext = path.extname(filePath);
+            res.writeHead(200, { 'Content-Type': getMime(ext) });
+            res.end(data);
+        });
+    });
+});
+
+// --- WebSocket Upgrade ---
+server.on('upgrade', (req, socket, head) => {
+    if (req.headers['upgrade']?.toLowerCase() !== 'websocket') { socket.destroy(); return; }
+    wsHandshake(req, socket);
+    wsClients.add(socket);
+    let buf = Buffer.alloc(0);
+
+    socket.on('data', (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        while (buf.length >= 2) {
+            const sz = frameSize(buf);
+            if (buf.length < sz) break;
+            const frame = wsDecodeFrame(buf);
+            buf = buf.slice(sz);
+            if (!frame) break;
+            if (frame.opcode === 8) { socket.destroy(); wsClients.delete(socket); break; }
+            if (frame.opcode === 9) { // ping -> pong
+                const pong = Buffer.alloc(2); pong[0] = 0x8a; pong[1] = 0; socket.write(pong);
+            }
+        }
     });
 
-    app.post('/send/:id', async (req, res) => {
-        const c = cascades.get(req.params.id);
-        if (!c) return res.status(404).json({ error: 'Cascade not found' });
+    socket.on('close', () => wsClients.delete(socket));
+    socket.on('error', () => { wsClients.delete(socket); socket.destroy(); });
 
-        // Re-using the injection logic logic would be long, 
-        // but let's assume valid injection for brevity in this single-file request:
-        // We'll trust the previous logic worked, just pointing it to c.cdp
+    // Send cascade list immediately
+    const list = Array.from(cascades.values()).map(c => ({ id: c.id, title: c.metadata.chatTitle, window: c.metadata.windowTitle, active: c.metadata.isActive }));
+    try { socket.write(wsEncodeFrame(JSON.stringify({ type: 'cascade_list', cascades: list }))); } catch { }
+});
 
-        // ... (Injection logic here would be same as before, simplified for brevity of this file edit)
-        // For now, let's just log it to prove flow works
-        console.log(`Message to ${c.metadata.chatTitle}: ${req.body.message}`);
-        // TODO: Port the full injection script back in if needed, 
-        // but user asked for "update" which implies features, I'll assume I should include it.
-        // See helper below.
-
-        const result = await injectMessage(c.cdp, req.body.message);
-        if (result.ok) res.json({ success: true });
-        else res.status(500).json(result);
-    });
-
-
-    wss.on('connection', (ws) => {
-        broadcastCascadeList(); // Send list on connect
-    });
-
-    const PORT = process.env.PORT || 3000;
-    server.listen(PORT, '0.0.0.0', () => {
-        console.log(`🚀 Server running on port ${PORT}`);
-    });
-
-    // Start Loops
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server running on port ${PORT}`);
     discover();
     setInterval(discover, DISCOVERY_INTERVAL);
     setInterval(updateSnapshots, POLL_INTERVAL);
-}
-
-// Injection Helper (Moved down to keep main clear)
-async function injectMessage(cdp, text) {
-    const SCRIPT = `(async () => {
-        // Try contenteditable first, then textarea
-        const editor = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea');
-        if (!editor) return { ok: false, reason: "no editor found" };
-        
-        editor.focus();
-        
-        if (editor.tagName === 'TEXTAREA') {
-            const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
-            nativeTextAreaValueSetter.call(editor, "${text.replace(/"/g, '\\"')}");
-            editor.dispatchEvent(new Event('input', { bubbles: true }));
-        } else {
-            document.execCommand("selectAll", false, null);
-            document.execCommand("insertText", false, "${text.replace(/"/g, '\\"')}");
-        }
-        
-        await new Promise(r => setTimeout(r, 100));
-        
-        // Try multiple button selectors
-        const btn = document.querySelector('button[class*="arrow"]') || 
-                   document.querySelector('button[aria-label*="Send"]') ||
-                   document.querySelector('button[type="submit"]');
-
-        if (btn) {
-            btn.click();
-        } else {
-             // Fallback to Enter key
-             editor.dispatchEvent(new KeyboardEvent("keydown", { bubbles:true, key:"Enter" }));
-        }
-        return { ok: true };
-    })()`;
-
-    try {
-        const res = await cdp.call("Runtime.evaluate", {
-            expression: SCRIPT,
-            returnByValue: true,
-            contextId: cdp.rootContextId
-        });
-        return res.result?.value || { ok: false };
-    } catch (e) { return { ok: false, reason: e.message }; }
-}
-
-main();
+});
